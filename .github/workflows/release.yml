@@ -1,0 +1,73 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching the version in Cargo.toml) to publish
+# binaries that `jiotv update` can install.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [full, slim]
+        target:
+          - { triple: x86_64-unknown-linux-musl, os: ubuntu-latest, zig: true }
+          - { triple: aarch64-unknown-linux-musl, os: ubuntu-latest, zig: true }
+          - { triple: armv7-unknown-linux-musleabihf, os: ubuntu-latest, zig: true }
+          - { triple: aarch64-apple-darwin, os: macos-latest, zig: false }
+    runs-on: ${{ matrix.target.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target.triple }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target.triple }}-${{ matrix.variant }}
+      - name: Install zig and cargo-zigbuild
+        if: matrix.target.zig
+        run: |
+          pip3 install ziglang
+          cargo install --locked cargo-zigbuild
+      - name: Build
+        shell: bash
+        run: |
+          flags=""
+          [ "${{ matrix.variant }}" = slim ] && flags="--no-default-features --features slim"
+          if [ "${{ matrix.target.zig }}" = true ]; then
+            cargo zigbuild --release --locked --target ${{ matrix.target.triple }} $flags
+          else
+            cargo build --release --locked --target ${{ matrix.target.triple }} $flags
+          fi
+          mkdir -p out
+          cp target/${{ matrix.target.triple }}/release/jiotv out/jiotv-${{ matrix.variant }}-${{ matrix.target.triple }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jiotv-${{ matrix.variant }}-${{ matrix.target.triple }}
+          path: out/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches Cargo.toml
+        run: |
+          want="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          [ "$want" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version $want"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum jiotv-* > SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --title "${GITHUB_REF_NAME}" --generate-notes

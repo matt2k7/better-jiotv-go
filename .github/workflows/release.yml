@@ -2,8 +2,6 @@ name: Release
 
 # Push a tag like v0.2.0 (matching the version in Cargo.toml) to publish
 # binaries that `jiotv update` can install.
-name: Release
-
 on:
   push:
     tags: ["v*"]

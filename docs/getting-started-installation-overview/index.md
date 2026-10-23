@@ -20,7 +20,7 @@ Choose your server device first:
 | Raspberry Pi or Linux mini-computer | [Raspberry Pi and SBC](../installations-sbc/index.md) |
 | Android with a terminal app | [Termux](../installations-termux/index.md) |
 | Docker host | [Docker and Compose](../installations-docker/index.md) |
-| Existing downloaded executable | [Manual binary](../installations-build-from-source/index.md) |
+| Existing downloaded executable | [Manual binary](../installations-manual-binary/index.md) |
 | Developer with a Rust toolchain | [Build from source](../installations-build-from-source/index.md) |
 
 The **full** build serves the web interface. A **slim** build has no web interface and is for IPTV clients. Extras is optional and depends on how the binary was built. Select the full build if this is your first installation.

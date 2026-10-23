@@ -7,7 +7,7 @@ keywords: [quick start, first run, JioTV account, OTP, watch channel, setup link
 
 # Getting Started in 5 Minutes
 
-This is the shortest path from a new installation to browsing live channels. You need your own JioTV account and a computer or router that can run the server. **Five minutes** is the approximate hands-on setup time; downloads and OTP delivery may take longer.
+This browser setup requires the **full** build; the slim build has no web interface. You need your own JioTV account and a computer or router that can run the server. **Five minutes** is the approximate hands-on setup time; downloads and OTP delivery may take longer.
 
 ## 1. Install JioTV
 

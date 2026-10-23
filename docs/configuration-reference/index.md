@@ -37,7 +37,7 @@ Save, start with `jiotv --config ./jiotv_go.toml serve`, then open `http://local
 | `epg` | `JIOTV_EPG` | `false` | Boolean. Generate/refresh the XMLTV guide. |
 | `debug` | `JIOTV_DEBUG` | `false` | Boolean. Show more diagnostic output. |
 | `disable_ts_handler` | `JIOTV_DISABLE_TS_HANDLER` | `false` | Boolean. Avoid local TS/AAC segment proxying when supported; change only when diagnosing HLS. |
-| `disable_logout` | `JIOTV_DISABLE_LOGOUT` | `false` | Boolean. Hide/disable JioTV logout when true. |
+| `disable_logout` | `JIOTV_DISABLE_LOGOUT` | `false` without a config file; `true` when omitted from TOML | Boolean. Hide/disable JioTV logout when true. |
 | `drm` | `JIOTV_DRM` | `true` | Boolean. Allow the protected DASH pathway; does not bypass DRM. |
 | `extras` | `JIOTV_EXTRAS` | `false` | Boolean. Enable optional Extras account integration. Requires a build with Extras support. |
 | `disable_auth` | `JIOTV_DISABLE_AUTH` | `false` | Boolean. Disable app access checks. Dangerous on reachable networks; use only with a trusted external access control. |

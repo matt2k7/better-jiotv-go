@@ -25,14 +25,14 @@ The account card shown below is from a clean server before login. It illustrates
 
 ## Switch using the CLI
 
-If logout is disabled in Settings, or you manage a headless server, use the commands below. Stop JioTV **before** changing the credentials so the running process does not overwrite the new state.
+If logout is disabled in Settings, or you manage a headless server, use the commands below. **Stop the JioTV service first.** Run both commands as the service's operating-system user with the same resolved `JIOTV_PATH_PREFIX` and configuration as the service, so the running process cannot overwrite the new state.
 
 ```sh
 jiotv login reset
 jiotv login otp
 ```
 
-Both commands must run as the **same operating-system user and with the same configuration/data directory** used by the server. The first clears the JioTV login; the second prompts for the new number and OTP. Then restart JioTV using your original command or service manager. For OpenWrt, follow its [service-management instructions](../maintenance-openwrt/index.md). For a Docker install, prefer the Settings workflow unless you know how to run commands against the container's persistent volume.
+The first command clears the JioTV login; the second prompts for the new number and OTP. **Restart JioTV after both commands** using your original command or service manager. For OpenWrt, follow its [service-management instructions](../maintenance-openwrt/index.md). For a Docker install, prefer the Settings workflow unless you know how to run commands against the container's persistent volume.
 
 ## If switching does not work
 

@@ -7,7 +7,7 @@ keywords: [first launch, admin password, access key, login, web setup]
 
 # First Launch and Admin Setup
 
-JioTV protects the admin interface with a password and its playlist routes with an access key. The **admin password** belongs to this local installation; your JioTV account has a separate OTP sign-in.
+This setup flow requires the **full** build. The slim build has no browser interface. JioTV protects the admin interface with a password and its playlist routes with an access key. The **admin password** belongs to this local installation; your JioTV account has a separate OTP sign-in.
 
 1. Run `jiotv serve` on the host.
 2. Look for **Web setup** in the terminal output. Open the full URL privately in your browser. The URL includes an access key.

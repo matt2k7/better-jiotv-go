@@ -503,6 +503,16 @@ pub async fn epg_handler(State(state): State<Arc<AppState>>) -> Response {
 const IST_OFFSET_MS: i64 = 5 * 60 * 60 * 1000 + 30 * 60 * 1000;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
+fn epg_day_offset_from_epoch(epoch_ms: i64) -> i64 {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let epg_day = (epoch_ms + IST_OFFSET_MS) / DAY_MS;
+    let today = (now_ms + IST_OFFSET_MS) / DAY_MS;
+    (today - epg_day).max(0)
+}
+
 /// How many days the getepg API's "today" lags the real date, derived from
 /// the `serverDate` it stamps on its response (both compared in IST day
 /// boundaries, matching the API's own). 0 means nothing to correct. Mirrors
@@ -534,13 +544,7 @@ fn web_epg_day_offset(body: &[u8]) -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let epg_day = (server_ms + IST_OFFSET_MS) / DAY_MS;
-    let today = (now_ms + IST_OFFSET_MS) / DAY_MS;
-    (today - epg_day).max(0)
+    epg_day_offset_from_epoch(server_ms)
 }
 
 async fn fetch_web_epg(
@@ -625,10 +629,27 @@ async fn extras_web_epg(state: &AppState, content_id: &str, offset: &str) -> Res
         Ok(o) if o >= 0 => o,
         _ => return (StatusCode::BAD_REQUEST, "Invalid offset").into_response(),
     };
-    let guide = match client.epg(&[content_id.to_string()], &[offset]).await {
+    let ids = [content_id.to_string()];
+    let mut guide = match client.epg(&ids, &[offset]).await {
         Ok(g) => g,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    let day_offset = guide
+        .get(content_id)
+        .and_then(|progs| progs.first())
+        .map(|program| epg_day_offset_from_epoch(program.start_epoch))
+        .unwrap_or(0);
+    if day_offset > 0 {
+        if let Ok(adjusted) = client.epg(&ids, &[offset + day_offset]).await {
+            if adjusted
+                .get(content_id)
+                .map(|progs| !progs.is_empty())
+                .unwrap_or(false)
+            {
+                guide = adjusted;
+            }
+        }
+    }
     let entries: Vec<serde_json::Value> = guide
         .get(content_id)
         .map(|progs| {
@@ -843,6 +864,16 @@ mod tests {
         let stale = "2020-01-01T00:00:00.000Z";
         let body = format!(r#"{{"epg":[{{"serverDate":"{stale}"}}]}}"#);
         assert!(web_epg_day_offset(body.as_bytes()) > 1000);
+    }
+
+    #[test]
+    fn extras_epg_day_offset_uses_programme_epoch() {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert_eq!(epg_day_offset_from_epoch(now_ms - 3 * DAY_MS), 3);
+        assert_eq!(epg_day_offset_from_epoch(now_ms + DAY_MS), 0);
     }
 
     #[test]

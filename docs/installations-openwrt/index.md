@@ -15,6 +15,14 @@ wget -qO- https://raw.githubusercontent.com/wpfyorg/better-jiotv-go/main/scripts
 
 By default, the installer enables the service and starts it. Open the browser interface at `https://<router-ip>:5443/` and accept the self-signed certificate warning. IPTV players use `http://<router-ip>:5001/`. The normal package is `full`; for headless installations, set `JIOTV_VARIANT=slim` before running the script. The slim package has no web interface and requires terminal OTP login.
 
+For the slim package, set the variant on the receiving shell:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/wpfyorg/better-jiotv-go/main/scripts/install.sh | JIOTV_VARIANT=slim sh
+```
+
+`JIOTV_VARIANT` accepts only `full` or `slim`. To select a release instead, set `JIOTV_VERSION` (for example, `JIOTV_VERSION=1.3.4`). These settings are independent. Both full and slim packages are published for OpenWrt `aarch64_cortex-a53` using `apk` and `opkg`.
+
 The service uses procd and starts at boot. Manage it with:
 
 ```sh

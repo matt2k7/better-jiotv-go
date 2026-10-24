@@ -556,7 +556,7 @@ pub async fn epg_handler(State(state): State<Arc<AppState>>) -> Response {
             .into_response();
     }
     // Off the event loop: a slow SD card must not stall live streams.
-    match tokio::fs::read(&path).await {
+    match std::fs::read(&path) {
         Ok(bytes) => Response::builder()
             .header(header::CONTENT_TYPE, "application/gzip")
             .header(header::CONTENT_ENCODING, "gzip")

@@ -59,8 +59,36 @@ struct ContextSnapshot {
     channels: Vec<crate::television::Channel>,
 }
 
+static CACHE_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Moves the XMLTV cache out of the data directory (to a RAM disk, say, so a
+/// router or SBC never writes it to flash). Call once at startup, before any
+/// cache path is used. An empty `dir` keeps the default location.
+pub fn set_cache_dir(dir: &str) -> std::io::Result<()> {
+    let dir = dir.trim();
+    if dir.is_empty() {
+        return Ok(());
+    }
+    let mut dir = dir.to_string();
+    if !dir.ends_with('/') && !dir.ends_with('\\') {
+        dir.push('/');
+    }
+    std::fs::create_dir_all(&dir)?;
+    let _ = CACHE_DIR.set(dir);
+    Ok(())
+}
+
+/// Where the guide is cached for a data directory `path_prefix` (which ends
+/// in `/`): the `epg_dir` override if one was set, else inside `path_prefix`.
+pub fn cache_file(path_prefix: &str) -> String {
+    match CACHE_DIR.get() {
+        Some(dir) => format!("{dir}epg.xml.gz"),
+        None => format!("{path_prefix}epg.xml.gz"),
+    }
+}
+
 fn cache_path(state: &AppState) -> String {
-    format!("{}epg.xml.gz", state.path_prefix)
+    cache_file(&state.path_prefix)
 }
 
 fn metadata_path(path: &str) -> String {
@@ -220,17 +248,58 @@ pub struct XmlProgramme {
     pub icon: String,
 }
 
-struct XmlChannel {
-    id: String,
-    display: String,
+/// Appends `s` to `out` with the five XML special characters escaped, in one
+/// pass and without the temporary strings a chain of `replace` calls makes.
+fn push_escaped(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
 }
 
+#[cfg(test)]
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    let mut out = String::with_capacity(s.len());
+    push_escaped(&mut out, s);
+    out
+}
+
+/// Appends one `<programme>` element to `buf`. `icon_prefix` and `icon` are
+/// escaped together as one attribute value.
+#[allow(clippy::too_many_arguments)]
+fn push_programme(
+    buf: &mut String,
+    channel: &str,
+    start: &str,
+    stop: &str,
+    title: &str,
+    desc: &str,
+    category: &str,
+    icon_prefix: &str,
+    icon: &str,
+) {
+    buf.push_str("<programme channel=\"");
+    buf.push_str(channel);
+    buf.push_str("\" start=\"");
+    buf.push_str(start);
+    buf.push_str("\" stop=\"");
+    buf.push_str(stop);
+    buf.push_str("\"><title lang=\"en\">");
+    push_escaped(buf, title);
+    buf.push_str("</title><desc lang=\"en\">");
+    push_escaped(buf, desc);
+    buf.push_str("</desc><category lang=\"en\">");
+    push_escaped(buf, category);
+    buf.push_str("</category><icon src=\"");
+    push_escaped(buf, icon_prefix);
+    push_escaped(buf, icon);
+    buf.push_str("\"></icon></programme>");
 }
 
 /// Formats a Unix-millisecond epoch as XMLTV's `"20060102150405 -0700"`
@@ -265,12 +334,22 @@ async fn fetch_epg_for_channel(client: &reqwest::Client, channel_id: i64) -> Vec
     out
 }
 
-async fn generate_xml_from_sources(
+const XML_HEADER: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\t<!DOCTYPE tv SYSTEM \"http://www.w3.org/2006/05/tv\">";
+
+/// How much XML is staged in memory before it is handed to the compressor.
+const EPG_FLUSH_BYTES: usize = 16 * 1024;
+
+/// Builds the XMLTV guide and gzips it as it goes, entirely in memory.
+/// Each channel's schedule is written out and dropped as soon as it arrives,
+/// so the full guide is never held as parsed structs plus one giant XML
+/// string at the same time; only the compressed output (a couple of MB)
+/// grows. The bytes produced are identical to building the whole string first.
+async fn generate_xml_gz_from_sources(
     client: &reqwest::Client,
     tv_sources: Vec<(String, String)>,
     extra_sources: Vec<(String, String)>,
     extra_programmes: Vec<XmlProgramme>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Vec<u8>> {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(20));
     let mut tasks = Vec::new();
     for (channel_id, _) in &tv_sources {
@@ -285,75 +364,68 @@ async fn generate_xml_from_sources(
         }));
     }
 
-    let mut programmes = Vec::new();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut buf = String::with_capacity(EPG_FLUSH_BYTES + 4096);
+    buf.push_str(XML_HEADER);
+    buf.push_str(r#"<tv version="" encoding="">"#);
+    for (id, display) in tv_sources.iter().chain(extra_sources.iter()) {
+        buf.push_str("<channel id=\"");
+        push_escaped(&mut buf, id);
+        buf.push_str("\"><display-name>");
+        push_escaped(&mut buf, display);
+        buf.push_str("</display-name></channel>");
+    }
+
+    let mut programme_count = 0usize;
     for task in tasks {
-        if let Ok((id, entries)) = task.await {
-            for e in entries {
-                programmes.push(XmlProgramme {
-                    channel: id.to_string(),
-                    start: format_xmltv_time(e.start_epoch),
-                    stop: format_xmltv_time(e.end_epoch),
-                    title: e.title,
-                    desc: e.description,
-                    category: e.show_category,
-                    icon: format!("{EPG_POSTER_URL}{}", e.poster),
-                });
+        let Ok((id, entries)) = task.await else {
+            continue;
+        };
+        let channel = id.to_string();
+        for e in &entries {
+            push_programme(
+                &mut buf,
+                &channel,
+                &format_xmltv_time(e.start_epoch),
+                &format_xmltv_time(e.end_epoch),
+                &e.title,
+                &e.description,
+                &e.show_category,
+                EPG_POSTER_URL,
+                &e.poster,
+            );
+            programme_count += 1;
+            if buf.len() >= EPG_FLUSH_BYTES {
+                gz.write_all(buf.as_bytes())?;
+                buf.clear();
             }
         }
     }
-    programmes.extend(extra_programmes);
+    for p in &extra_programmes {
+        push_programme(
+            &mut buf, &p.channel, &p.start, &p.stop, &p.title, &p.desc, &p.category, "", &p.icon,
+        );
+        programme_count += 1;
+        if buf.len() >= EPG_FLUSH_BYTES {
+            gz.write_all(buf.as_bytes())?;
+            buf.clear();
+        }
+    }
 
-    if programmes.is_empty() {
+    if programme_count == 0 {
         anyhow::bail!("no EPG programmes were fetched");
     }
 
-    let extra_channels: Vec<XmlChannel> = extra_sources
-        .into_iter()
-        .map(|(id, display)| XmlChannel { id, display })
-        .collect();
-
-    let mut xml = String::new();
-    xml.push_str(r#"<tv version="" encoding="">"#);
-    for (id, display) in &tv_sources {
-        xml.push_str(&format!(
-            "<channel id=\"{}\"><display-name>{}</display-name></channel>",
-            xml_escape(id),
-            xml_escape(display)
-        ));
-    }
-    for ch in &extra_channels {
-        xml.push_str(&format!(
-            "<channel id=\"{}\"><display-name>{}</display-name></channel>",
-            xml_escape(&ch.id),
-            xml_escape(&ch.display)
-        ));
-    }
-    for p in &programmes {
-        xml.push_str(&format!(
-            "<programme channel=\"{}\" start=\"{}\" stop=\"{}\"><title lang=\"en\">{}</title><desc lang=\"en\">{}</desc><category lang=\"en\">{}</category><icon src=\"{}\"></icon></programme>",
-            p.channel, p.start, p.stop, xml_escape(&p.title), xml_escape(&p.desc), xml_escape(&p.category), xml_escape(&p.icon)
-        ));
-    }
-    xml.push_str("</tv>");
-    Ok(xml)
+    buf.push_str("</tv>");
+    gz.write_all(buf.as_bytes())?;
+    Ok(gz.finish()?)
 }
 
-async fn generate_xml_gz_from_sources(
-    client: &reqwest::Client,
-    tv_sources: Vec<(String, String)>,
-    extra_sources: Vec<(String, String)>,
-    extra_programmes: Vec<XmlProgramme>,
-) -> anyhow::Result<Vec<u8>> {
-    let xml =
-        generate_xml_from_sources(client, tv_sources, extra_sources, extra_programmes).await?;
-    gzip_xml(&xml)
-}
-
+#[cfg(test)]
 fn gzip_xml(xml: &str) -> anyhow::Result<Vec<u8>> {
-    let header = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\t<!DOCTYPE tv SYSTEM \"http://www.w3.org/2006/05/tv\">";
-    let full = format!("{header}{xml}");
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    gz.write_all(full.as_bytes())?;
+    gz.write_all(XML_HEADER.as_bytes())?;
+    gz.write_all(xml.as_bytes())?;
     Ok(gz.finish()?)
 }
 
@@ -483,7 +555,8 @@ pub async fn epg_handler(State(state): State<Arc<AppState>>) -> Response {
         )
             .into_response();
     }
-    match std::fs::read(&path) {
+    // Off the event loop: a slow SD card must not stall live streams.
+    match tokio::fs::read(&path).await {
         Ok(bytes) => Response::builder()
             .header(header::CONTENT_TYPE, "application/gzip")
             .header(header::CONTENT_ENCODING, "gzip")

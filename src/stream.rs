@@ -194,10 +194,23 @@ impl RenderCaches {
         if channel_id.is_empty() {
             return false;
         }
-        match self.dead.read().unwrap().get(channel_id) {
-            Some(at) => at.elapsed() <= DEAD_CACHE_TTL,
-            None => false,
+
+        // Fast path for a live entry. Expired entries are removed below so
+        // probing a channel does not leave stale dead-channel keys resident.
+        let expired_at = {
+            let map = self.dead.read().unwrap();
+            match map.get(channel_id) {
+                Some(at) if at.elapsed() <= DEAD_CACHE_TTL => return true,
+                Some(at) => *at,
+                None => return false,
+            }
+        };
+
+        let mut map = self.dead.write().unwrap();
+        if map.get(channel_id).map(|at| *at == expired_at).unwrap_or(false) {
+            map.remove(channel_id);
         }
+        false
     }
 
     /// Marks the channel dead unless the caches were cleared since
@@ -210,6 +223,9 @@ impl RenderCaches {
         if self.generation() != generation {
             return;
         }
+        // Dead-channel markers have a short TTL. Prune stale keys whenever a
+        // new marker is inserted, preventing old channel IDs accumulating.
+        map.retain(|_, at| at.elapsed() <= DEAD_CACHE_TTL);
         map.insert(channel_id.to_string(), Instant::now());
     }
 
@@ -666,6 +682,11 @@ async fn live_impl_inner(
 
     let mut live_url = television::select_best_live_hls_url(&live, quality);
     if live_url.is_empty() {
+        // The provider serves this channel only as DASH: remember it, so the
+        // next playlist refresh points players at the DRM route.
+        if television::has_dash(&live) {
+            state.learn_drm(id);
+        }
         // A extras channel with only DASH: send the player to the MPD route.
         let is_custom = state.custom_channels.contains(id);
         let via_extras = state
@@ -683,6 +704,7 @@ async fn live_impl_inner(
         );
         return (StatusCode::NOT_FOUND, message).into_response();
     }
+    state.unlearn_drm(id);
     live_url = to_absolute_stream_url(&live_url, absolute_base_from_live(&live).as_deref());
     let live_hdnea = television::select_hls_hdnea_token(&live, quality, "");
     if !live_hdnea.is_empty() {
@@ -1350,14 +1372,22 @@ pub async fn render_ts_handler(
     if let Some(ct) = headers {
         builder = builder.header(header::CONTENT_TYPE, ct);
     }
-    builder.body(Body::from(body)).unwrap()
+    builder.body(body).unwrap()
+}
+
+/// Forwards an upstream response body to the client frame by frame instead
+/// of collecting it first. A segment is therefore never held in RAM as a whole
+/// (and never copied a second time), and if the player disconnects the
+/// upstream request is dropped with it.
+pub(crate) fn passthrough_body(resp: reqwest::Response) -> Body {
+    Body::new(reqwest::Body::from(resp))
 }
 
 async fn proxy_segment(
     state: &AppState,
     url: &str,
     hdnea: Option<&str>,
-) -> (u16, Vec<u8>, Option<String>) {
+) -> (u16, Body, Option<String>) {
     let ua = url::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(|h| state.extras.player_user_agent_for(h)))
@@ -1374,10 +1404,9 @@ async fn proxy_segment(
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
-            let body = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
-            (status, body, ct)
+            (status, passthrough_body(resp), ct)
         }
-        Err(_) => (502, Vec::new(), None),
+        Err(_) => (502, Body::empty(), None),
     }
 }
 

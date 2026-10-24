@@ -25,6 +25,10 @@ pub struct Config {
     pub disable_url_encryption: bool,
     pub proxy: String,
     pub path_prefix: String,
+    /// Optional directory for the generated `epg.xml.gz` (and its sidecar), so
+    /// the guide can live on a RAM disk such as `/dev/shm/jiotv` instead of
+    /// flash or an SD card. Empty means "inside `path_prefix`".
+    pub epg_dir: String,
     pub log_path: String,
     #[serde(default = "default_true")]
     pub log_to_stdout: bool,
@@ -51,6 +55,7 @@ impl Default for Config {
             disable_url_encryption: false,
             proxy: String::new(),
             path_prefix: String::new(),
+            epg_dir: String::new(),
             log_path: String::new(),
             log_to_stdout: true,
             custom_channels_file: String::new(),
@@ -111,6 +116,7 @@ impl Config {
         env_bool!(disable_url_encryption, "JIOTV_DISABLE_URL_ENCRYPTION");
         env_str!(proxy, "JIOTV_PROXY");
         env_str!(path_prefix, "JIOTV_PATH_PREFIX");
+        env_str!(epg_dir, "JIOTV_EPG_DIR");
         env_str!(log_path, "JIOTV_LOG_PATH");
         env_bool!(log_to_stdout, "JIOTV_LOG_TO_STDOUT");
         env_str!(custom_channels_file, "JIOTV_CUSTOM_CHANNELS_FILE");

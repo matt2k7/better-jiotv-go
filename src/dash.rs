@@ -857,14 +857,14 @@ pub async fn render_dash_handler(
     if let Some(ct) = ct {
         builder = builder.header(header::CONTENT_TYPE, ct);
     }
-    builder.body(Body::from(body)).unwrap()
+    builder.body(body).unwrap()
 }
 
 async fn proxy_dash_segment(
     state: &AppState,
     url: &str,
     hdnea: Option<&str>,
-) -> (u16, Vec<u8>, Option<String>) {
+) -> (u16, Body, Option<String>) {
     let ua = player_user_agent_for(state, url);
     let mut req = state.http.get(url).header(header::USER_AGENT, ua);
     if let Some(t) = hdnea {
@@ -878,10 +878,9 @@ async fn proxy_dash_segment(
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
-            let body = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
-            (status, body, ct)
+            (status, crate::stream::passthrough_body(resp), ct)
         }
-        Err(_) => (502, Vec::new(), None),
+        Err(_) => (502, Body::empty(), None),
     }
 }
 

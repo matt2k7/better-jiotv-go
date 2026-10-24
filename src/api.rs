@@ -608,6 +608,12 @@ fn live_play_response_from_live(
 
     if let Ok(out) = crate::dash::build_drm_mpd_output(state, live, id, quality) {
         if !out.play_url.is_empty() {
+            // DASH with no HLS alternative: remember it for the playlist.
+            if hls.is_null() {
+                state.learn_drm(id);
+            } else {
+                state.unlearn_drm(id);
+            }
             let license = if out.license_url.is_empty() {
                 serde_json::Value::Null
             } else {

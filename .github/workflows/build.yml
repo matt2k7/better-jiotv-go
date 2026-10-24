@@ -1,0 +1,83 @@
+name: Build custom binaries
+
+# Manual only: Actions tab -> "Build custom binaries" -> Run workflow.
+# (No push trigger, so replacing files one by one doesn't start a build each time.)
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { triple: x86_64-pc-windows-msvc, os: windows-2022, kind: native }
+          - { triple: aarch64-unknown-linux-musl, os: ubuntu-latest, kind: zig }
+        variant: [slim, full]
+    runs-on: ${{ matrix.target.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target.triple }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target.triple }}-${{ matrix.variant }}
+
+      - name: Install Zig
+        if: matrix.target.kind == 'zig'
+        run: pip3 install ziglang
+
+      - uses: taiki-e/install-action@v2
+        if: matrix.target.kind == 'zig'
+        with:
+          tool: cargo-zigbuild
+
+      # No --locked on purpose: Cargo.lock doesn't list mimalloc yet, so cargo
+      # has to add it. Everything already in the lock keeps its pinned version.
+      - name: Build
+        shell: bash
+        run: |
+          mkdir out
+          suffix=""
+          case "${{ matrix.target.triple }}" in *windows-msvc) suffix=.exe ;; esac
+          flags=()
+          if [ "${{ matrix.variant }}" = slim ]; then
+            flags=(--no-default-features --features slim)
+          fi
+          if [ "${{ matrix.target.kind }}" = zig ]; then
+            cargo zigbuild --release --target "${{ matrix.target.triple }}" "${flags[@]}"
+          else
+            cargo build --release --target "${{ matrix.target.triple }}" "${flags[@]}"
+          fi
+          cp "target/${{ matrix.target.triple }}/release/jiotv${suffix}" \
+             "out/jiotv-${{ matrix.variant }}-${{ matrix.target.triple }}${suffix}"
+
+      # Only the Windows binary can run on this runner.
+      - name: Smoke-test
+        if: matrix.target.kind == 'native'
+        shell: bash
+        run: |
+          for binary in out/*; do
+            "$binary" --help >/dev/null
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jiotv-${{ matrix.variant }}-${{ matrix.target.triple }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
+
+      # The updated lock file, so you can commit it to your fork afterwards.
+      - uses: actions/upload-artifact@v4
+        if: matrix.variant == 'slim' && matrix.target.kind == 'zig'
+        with:
+          name: Cargo.lock
+          path: Cargo.lock
+          retention-days: 14

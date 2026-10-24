@@ -58,6 +58,14 @@ tempfile = "3"
 url = "2"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
+# musl's built-in allocator fragments badly under the many short-lived, multi-MB
+# buffers a streaming proxy produces and rarely hands memory back to the OS.
+[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+# Direct access to `mi_collect` (only exposed by the `extended` feature),
+# used to hand freed pages back to the OS.
+libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 wiremock = "0.6"

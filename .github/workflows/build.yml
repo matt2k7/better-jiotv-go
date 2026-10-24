@@ -21,6 +21,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Prints exactly which source is being built, to spot a wrong branch or
+      # an old file at a glance. Expected: version 1.3.4, set_cache_dir hits 1,
+      # epg_dir hits 3, epg.rs 1084 lines.
+      - name: Show what is being built
+        shell: bash
+        run: |
+          git log -1 --format='commit %h on ${{ github.ref_name }}: %s'
+          grep -m1 '^version' Cargo.toml
+          echo "epg.rs: $(wc -l < src/epg.rs) lines, set_cache_dir hits: $(grep -c set_cache_dir src/epg.rs)"
+          echo "config.rs epg_dir hits: $(grep -c epg_dir src/config.rs)"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target.triple }}

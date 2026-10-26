@@ -19,6 +19,43 @@
     }
   }
 
+  // Manual DRM channel scan (POST starts it, GET reports progress).
+  let scan = $state(null);
+  let scanNames = $state([]);
+  let scanTimer = null;
+
+  function stopPolling() {
+    if (scanTimer) clearInterval(scanTimer);
+    scanTimer = null;
+  }
+
+  async function nameLearned() {
+    try {
+      const channels = await loadChannels();
+      const byId = new Map(channels.map((c) => [String(c.id), c.name]));
+      scanNames = scan.learned.map((id) => byId.get(String(id)) ?? id);
+    } catch {
+      scanNames = scan.learned;
+    }
+  }
+
+  async function loadScan(start = false) {
+    try {
+      scan = await api("/api/drm/scan", start ? { method: "POST" } : {});
+      error = "";
+    } catch (err) {
+      stopPolling();
+      error = err.message;
+      return;
+    }
+    if (scan.running) {
+      if (!scanTimer) scanTimer = setInterval(() => loadScan(), 2000);
+    } else {
+      stopPolling();
+      await nameLearned();
+    }
+  }
+
   async function loginChanged() {
     await refresh();
     loadChannels(true);
@@ -73,7 +110,11 @@
   // opened on the server's own HTTPS port, offer the plain-HTTP origin instead.
   let iptvOrigin = $derived(plainHttpOrigin(location, status));
 
-  onMount(refresh);
+  onMount(() => {
+    refresh();
+    loadScan();
+  });
+  onDestroy(stopPolling);
 </script>
 
 {#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -99,6 +140,21 @@
         <JioTVLogin ondone={loginChanged} />
       {/if}
     </section>
+
+    {#if status.jiotv.loggedIn}
+      <section class="card">
+        <h2>DRM channels</h2>
+        <p class="muted">A few channels need DRM but are missing from the built-in list. In IPTV apps they show a black screen or no sound, while playing fine here. Scan once after JioTV adds new channels, then refresh the playlist in your app. It takes about 5 minutes.</p>
+        <button class="btn" onclick={() => loadScan(true)} disabled={scan?.running}>{scan?.running ? "Scanning…" : "Scan for DRM channels"}</button>
+        {#if scan?.running}
+          <p class="muted" role="status">Checked {scan.checked} of {scan.total || "…"} channels</p>
+        {:else if scan?.message}
+          <p role="status">{scan.message}</p>
+        {/if}
+        {#if scanNames.length}<p class="muted small">New: {scanNames.join(", ")}</p>{/if}
+        <p class="muted small">{scan?.learnedTotal ?? 0} channels learned so far.</p>
+      </section>
+    {/if}
 
     {#if status.extras.enabled}
       <section class="card">

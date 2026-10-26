@@ -71,6 +71,10 @@ fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/api/channels", get(crate::api::channels))
         .route("/api/account/password", post(crate::api::account_password))
         .route("/api/key/rotate", post(crate::api::rotate_key))
+        .route(
+            "/api/drm/scan",
+            get(crate::api::drm_scan_status).post(crate::api::drm_scan_start),
+        )
         .route("/api/jiotv/logout", post(crate::api::jiotv_logout))
         .route("/login/sendOTP", post(crate::api::jiotv_send_otp))
         .route("/login/verifyOTP", post(crate::api::jiotv_verify_otp))

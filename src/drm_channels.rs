@@ -83,7 +83,7 @@ pub const DRM_CHANNEL_IDS: &[&str] = &[
     "3451", "3452", "3453", "3454", "3455", "3456", "3457", "3458", "3460", "3462", "3463", "3464",
     "3470", "3471", "3483", "3484", "3485", "3486", "3490", "3493", "3498", "3502", "3508", "3519",
     "3530", "3532", "3537", "3538", "3546", "3548", "3549", "3551", "3552", "3553", "3555", "3556",
-    "3563", "3564", "3565", "3566", "3567", "3570", "3571", "3572", "3573", "3574",
+    "3563", "3564", "3565", "3566", "3567", "3570", "3571", "3572", "3573", "3574", "3622",
 ];
 
 pub fn is_drm_channel(id: &str) -> bool {
@@ -105,7 +105,13 @@ mod tests {
     }
 
     #[test]
+    fn sony_vizha_hd_is_drm() {
+        // Sony VIZHA HD only plays as Widevine DASH; routing it to HLS fails.
+        assert!(is_drm_channel("3622"));
+    }
+
+    #[test]
     fn list_matches_go_source_count() {
-        assert_eq!(DRM_CHANNEL_IDS.len(), 970);
+        assert_eq!(DRM_CHANNEL_IDS.len(), 971);
     }
 }

@@ -31,6 +31,31 @@ mod ui_assets;
 use std::io::Write;
 use std::sync::Arc;
 
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// mimalloc purges freed pages lazily, and only while the process keeps
+/// allocating, so after a burst of streaming the RSS can sit at its peak
+/// indefinitely. Forcing a collection every 30s returns that memory to the
+/// OS. It is cheap when the heap is small, and runs on the same thread that
+/// serves requests (the runtime is single-threaded), so it covers the hot heap.
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+fn spawn_memory_trimmer() {
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            // SAFETY: `mi_collect` only touches mimalloc's own bookkeeping.
+            unsafe { libmimalloc_sys::mi_collect(true) };
+        }
+    });
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "musl")))]
+fn spawn_memory_trimmer() {}
+
 fn main() -> anyhow::Result<()> {
     // Must run before any other thread exists (see `unlock::init_local_offset`).
     unlock::init_local_offset();
@@ -46,6 +71,12 @@ fn main() -> anyhow::Result<()> {
     init_logging(&cfg);
 
     let path_prefix = resolve_path_prefix(&cfg)?;
+    if let Err(e) = epg::set_cache_dir(&cfg.epg_dir) {
+        anyhow::bail!(
+            "cannot use epg_dir {:?}: {e}. Fix the path or remove the setting.",
+            cfg.epg_dir
+        );
+    }
     let store = Arc::new(store::Store::open(&path_prefix)?);
     let access = Arc::new(access::Access::new(store.clone()));
     let secure = Arc::new(secureurl::SecureUrl::new(cfg.disable_url_encryption));
@@ -114,7 +145,7 @@ async fn epg_generate(
     access: Arc<access::Access>,
     secure: Arc<secureurl::SecureUrl>,
 ) -> anyhow::Result<()> {
-    let path = format!("{path_prefix}epg.xml.gz");
+    let path = epg::cache_file(path_prefix);
     println!("Deleting existing EPG file if exists");
     epg_delete_files(&path)?;
     println!("Generating new EPG file... this can take a few minutes.");
@@ -199,7 +230,7 @@ extern "C" {
 }
 
 fn epg_delete(path_prefix: &str) -> anyhow::Result<()> {
-    let path = format!("{path_prefix}epg.xml.gz");
+    let path = epg::cache_file(path_prefix);
     println!("Deleting existing EPG file if exists");
     let existed = std::path::Path::new(&path).exists();
     epg_delete_files(&path)?;
@@ -352,7 +383,7 @@ async fn serve(
     // the server must listen even if an upstream stalls. `/epg.xml.gz` answers
     // 503 until validation has set the current fingerprint, so nothing stale is
     // served in the meantime.
-    let epg_path = format!("{path_prefix}epg.xml.gz");
+    let epg_path = epg::cache_file(&path_prefix);
     let epg_enabled = cfg.epg;
     if epg_enabled || std::path::Path::new(&epg_path).exists() {
         let state = state.clone();
@@ -445,6 +476,7 @@ async fn serve(
     }
 
     tracing::info!("listening");
+    spawn_memory_trimmer();
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let signal_tx = stop_tx.clone();
     tokio::spawn(async move {
@@ -484,7 +516,12 @@ fn build_app_state(
     access: Arc<access::Access>,
     secure: Arc<secureurl::SecureUrl>,
 ) -> anyhow::Result<Arc<state::AppState>> {
-    let http = reqwest::Client::builder().build()?;
+    // No overall timeout (segments stream for a while), but a stalled upstream
+    // must not hang a request, a token refresh or EPG generation forever.
+    let http = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .build()?;
     let device_id = device_id(&store)?;
     let tv = Arc::new(television::Television::with_device_id(
         http.clone(),
@@ -516,6 +553,9 @@ fn build_app_state(
     let extras_state = Arc::new(extras_state::ExtrasState::new(cfg.extras, stored_override));
     extras_state.init(&http, &store);
 
+    let learned_drm =
+        state::parse_learned_drm(&store.get_opt(state::DRM_LEARNED_KEY).unwrap_or_default());
+
     Ok(Arc::new(state::AppState {
         config: cfg.clone(),
         path_prefix: path_prefix.to_string(),
@@ -524,7 +564,7 @@ fn build_app_state(
         tv,
         secure,
         http: http.clone(),
-        drm_channels: Default::default(),
+        drm_channels: std::sync::RwLock::new(learned_drm),
         custom_channels,
         render_caches: Default::default(),
         dash_state: Default::default(),

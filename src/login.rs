@@ -256,19 +256,23 @@ pub const TOUCH_ALL: Touch = Touch {
 /// Saves the login under the same store keys as the Go version
 /// (`WriteJIOTVCredentials`), so either binary can use the store.
 pub fn save(store: &crate::store::Store, creds: &Credentials, touch: Touch) -> anyhow::Result<()> {
-    store.set("ssoToken", &creds.sso_token)?;
-    store.set("crm", &creds.crm)?;
-    store.set("uniqueId", &creds.unique_id)?;
-    store.set("accessToken", &creds.access_token)?;
-    store.set("refreshToken", &creds.refresh_token)?;
     let now = now_unix();
+    let mut set: Vec<(&str, &str)> = vec![
+        ("ssoToken", creds.sso_token.as_str()),
+        ("crm", creds.crm.as_str()),
+        ("uniqueId", creds.unique_id.as_str()),
+        ("accessToken", creds.access_token.as_str()),
+        ("refreshToken", creds.refresh_token.as_str()),
+    ];
     if touch.access || store.get_opt("lastTokenRefreshTime").is_none() {
-        store.set("lastTokenRefreshTime", &now)?;
+        set.push(("lastTokenRefreshTime", now.as_str()));
     }
     if touch.sso || store.get_opt("lastSSOTokenRefreshTime").is_none() {
-        store.set("lastSSOTokenRefreshTime", &now)?;
+        set.push(("lastSSOTokenRefreshTime", now.as_str()));
     }
-    let _ = store.delete("jiotv_credentials");
+    // One write for the whole login (it used to be up to eight), and none for
+    // keys whose value did not change.
+    store.apply(&set, &["jiotv_credentials"])?;
     Ok(())
 }
 
@@ -300,18 +304,19 @@ pub fn last_refresh(store: &crate::store::Store, sso: bool) -> Option<u64> {
 }
 
 pub fn clear(store: &crate::store::Store) -> anyhow::Result<()> {
-    for key in [
-        "ssoToken",
-        "crm",
-        "uniqueId",
-        "accessToken",
-        "refreshToken",
-        "lastTokenRefreshTime",
-        "lastSSOTokenRefreshTime",
-        "jiotv_credentials",
-    ] {
-        let _ = store.delete(key);
-    }
+    let _ = store.apply(
+        &[],
+        &[
+            "ssoToken",
+            "crm",
+            "uniqueId",
+            "accessToken",
+            "refreshToken",
+            "lastTokenRefreshTime",
+            "lastSSOTokenRefreshTime",
+            "jiotv_credentials",
+        ],
+    );
     Ok(())
 }
 

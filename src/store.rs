@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -57,8 +58,44 @@ impl Store {
 
     fn save(&self) -> Result<(), StoreError> {
         let guard = self.inner.lock().unwrap();
-        let text = toml::to_string(&*guard)?;
-        std::fs::write(&self.path, text)?;
+        self.write_atomic(&guard)
+    }
+
+    /// Writes the whole file via a temp file in the same directory and a
+    /// rename, so a power cut leaves either the old or the new file, never a
+    /// truncated one. Callers hold the lock, which keeps writes ordered.
+    fn write_atomic(&self, data: &FileFormat) -> Result<(), StoreError> {
+        let text = toml::to_string(data)?;
+        let tmp = self.path.with_extension("toml.tmp");
+        {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(text.as_bytes())?;
+        }
+        if let Ok(meta) = std::fs::metadata(&self.path) {
+            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        }
+        std::fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
+
+    /// Sets and removes several keys with at most one write. The file is not
+    /// touched at all if nothing actually changes, which spares flash/SD cards
+    /// the redundant rewrites a key-by-key save would make.
+    pub fn apply(&self, set: &[(&str, &str)], remove: &[&str]) -> Result<(), StoreError> {
+        let mut guard = self.inner.lock().unwrap();
+        let mut changed = false;
+        for (key, value) in set {
+            if guard.data.get(*key).map(String::as_str) != Some(*value) {
+                guard.data.insert((*key).to_string(), (*value).to_string());
+                changed = true;
+            }
+        }
+        for key in remove {
+            changed |= guard.data.remove(*key).is_some();
+        }
+        if changed {
+            self.write_atomic(&guard)?;
+        }
         Ok(())
     }
 
@@ -77,19 +114,11 @@ impl Store {
     }
 
     pub fn set(&self, key: &str, value: &str) -> Result<(), StoreError> {
-        {
-            let mut guard = self.inner.lock().unwrap();
-            guard.data.insert(key.to_string(), value.to_string());
-        }
-        self.save()
+        self.apply(&[(key, value)], &[])
     }
 
     pub fn delete(&self, key: &str) -> Result<(), StoreError> {
-        {
-            let mut guard = self.inner.lock().unwrap();
-            guard.data.remove(key);
-        }
-        self.save()
+        self.apply(&[], &[key])
     }
 }
 
@@ -114,6 +143,29 @@ mod tests {
         std::fs::write(&path, "[data]\naccess_key = \"deadbeef\"\n").unwrap();
         let store = Store::open(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(store.get("access_key").unwrap(), "deadbeef");
+    }
+
+    #[test]
+    fn apply_batches_and_skips_unchanged_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().to_str().unwrap()).unwrap();
+        store
+            .apply(&[("a", "1"), ("b", "2")], &["missing"])
+            .unwrap();
+        let file = dir.path().join("store_v4.toml");
+        // Remove the file: an unchanged apply must not recreate it...
+        std::fs::remove_file(&file).unwrap();
+        store.apply(&[("a", "1"), ("b", "2")], &["missing"]).unwrap();
+        store.set("a", "1").unwrap();
+        store.delete("missing").unwrap();
+        assert!(!file.exists());
+        // ...while a real change writes it again, and leaves no temp file.
+        store.apply(&[("a", "9")], &["b"]).unwrap();
+        assert!(file.exists());
+        assert!(!dir.path().join("store_v4.toml.tmp").exists());
+        let reopened = Store::open(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(reopened.get("a").unwrap(), "9");
+        assert!(reopened.get("b").is_err());
     }
 
     #[test]

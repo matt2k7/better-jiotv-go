@@ -13,6 +13,10 @@ pub struct Config {
     pub epg: bool,
     pub debug: bool,
     pub disable_ts_handler: bool,
+    /// Channel IDs (comma separated) whose video segments still go through the
+    /// TS handler even when `disable_ts_handler` is on. For the few channels
+    /// whose CDN rejects a player that fetches segments directly.
+    pub ts_proxy_channels: String,
     #[serde(default = "default_true")]
     pub disable_logout: bool,
     pub drm: bool,
@@ -25,6 +29,10 @@ pub struct Config {
     pub disable_url_encryption: bool,
     pub proxy: String,
     pub path_prefix: String,
+    /// Optional directory for the generated `epg.xml.gz` (and its sidecar), so
+    /// the guide can live on a RAM disk such as `/dev/shm/jiotv` instead of
+    /// flash or an SD card. Empty means "inside `path_prefix`".
+    pub epg_dir: String,
     pub log_path: String,
     #[serde(default = "default_true")]
     pub log_to_stdout: bool,
@@ -43,6 +51,7 @@ impl Default for Config {
             epg: false,
             debug: false,
             disable_ts_handler: false,
+            ts_proxy_channels: String::new(),
             disable_logout: false,
             drm: true,
             extras: false,
@@ -51,6 +60,7 @@ impl Default for Config {
             disable_url_encryption: false,
             proxy: String::new(),
             path_prefix: String::new(),
+            epg_dir: String::new(),
             log_path: String::new(),
             log_to_stdout: true,
             custom_channels_file: String::new(),
@@ -61,6 +71,15 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Whether `channel_id` is on the `ts_proxy_channels` list.
+    pub fn ts_proxy_wanted(&self, channel_id: &str) -> bool {
+        !channel_id.is_empty()
+            && self
+                .ts_proxy_channels
+                .split(',')
+                .any(|id| id.trim() == channel_id)
+    }
+
     /// Loads config from `filename` if given, else the first common config
     /// file in the current directory, else environment variables only.
     pub fn load(filename: Option<&str>) -> anyhow::Result<Config> {
@@ -100,6 +119,7 @@ impl Config {
         env_bool!(epg, "JIOTV_EPG");
         env_bool!(debug, "JIOTV_DEBUG");
         env_bool!(disable_ts_handler, "JIOTV_DISABLE_TS_HANDLER");
+        env_str!(ts_proxy_channels, "JIOTV_TS_PROXY_CHANNELS");
         env_bool!(disable_logout, "JIOTV_DISABLE_LOGOUT");
         env_bool!(drm, "JIOTV_DRM");
         // `JIOTV_EXTRAS` is the current env var; `JIOTV_TVPLUS` is accepted
@@ -111,6 +131,7 @@ impl Config {
         env_bool!(disable_url_encryption, "JIOTV_DISABLE_URL_ENCRYPTION");
         env_str!(proxy, "JIOTV_PROXY");
         env_str!(path_prefix, "JIOTV_PATH_PREFIX");
+        env_str!(epg_dir, "JIOTV_EPG_DIR");
         env_str!(log_path, "JIOTV_LOG_PATH");
         env_bool!(log_to_stdout, "JIOTV_LOG_TO_STDOUT");
         env_str!(custom_channels_file, "JIOTV_CUSTOM_CHANNELS_FILE");

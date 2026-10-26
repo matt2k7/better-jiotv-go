@@ -9,6 +9,28 @@ use crate::stream::RenderCaches;
 use crate::television::Television;
 use std::sync::Arc;
 
+/// Store key holding the comma-separated IDs of channels learned to be DASH-only.
+pub const DRM_LEARNED_KEY: &str = "drmLearned";
+
+fn is_learnable_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 8 && id.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Reads the persisted learned-channel list, ignoring anything malformed.
+pub fn parse_learned_drm(csv: &str) -> std::collections::HashSet<String> {
+    csv.split(',')
+        .map(str::trim)
+        .filter(|s| is_learnable_id(s))
+        .map(String::from)
+        .collect()
+}
+
+fn learned_drm_csv(set: &std::collections::HashSet<String>) -> String {
+    let mut ids: Vec<&str> = set.iter().map(String::as_str).collect();
+    ids.sort_unstable();
+    ids.join(",")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveProduct {
     Tv,
@@ -34,11 +56,9 @@ pub struct AppState {
     pub tv: Arc<Television>,
     pub secure: Arc<SecureUrl>,
     pub http: reqwest::Client,
-    /// Extra channels this server has been told (via `drm_channels.rs`'s
-    /// static list plus any learned entries) need a DASH/mpd route rather
-    /// than HLS. Currently just the static Go-sourced list; nothing adds to
-    /// it at runtime yet (extras's "learned extras_stream_kinds" persistence is not
-    /// implemented — see the final report).
+    /// Channels learned at runtime to be DASH-only (see `learn_drm`), on top
+    /// of the static list in `drm_channels.rs`. Loaded from the store at
+    /// startup and saved whenever it changes.
     pub drm_channels: std::sync::RwLock<std::collections::HashSet<String>>,
     pub custom_channels: Arc<CustomChannels>,
     pub render_caches: RenderCaches,
@@ -182,6 +202,47 @@ impl AppState {
                 crate::drm_channels::is_drm_channel(id)
                     || self.drm_channels.read().unwrap().contains(id)
             }
+        }
+    }
+
+    /// Remembers a channel whose provider response has a DASH stream but no
+    /// HLS one, so the next playlist routes it through the DRM/MPD route
+    /// instead of an HLS link that cannot work. Persisted, so it survives
+    /// restarts. Only numeric JioTV IDs outside the static list are learned,
+    /// and a new entry is a rare, tiny write.
+    pub fn learn_drm(&self, id: &str) {
+        if !is_learnable_id(id) || crate::drm_channels::is_drm_channel(id) {
+            return;
+        }
+        let csv = {
+            let mut set = self.drm_channels.write().unwrap();
+            if !set.insert(id.to_string()) {
+                return;
+            }
+            learned_drm_csv(&set)
+        };
+        tracing::info!(channel = id, "learned a DASH-only (DRM) channel");
+        if let Err(e) = self.store.set(DRM_LEARNED_KEY, &csv) {
+            tracing::warn!("could not save learned DRM channels: {e}");
+        }
+    }
+
+    /// Forgets a learned channel that has an HLS stream again.
+    pub fn unlearn_drm(&self, id: &str) {
+        // Read-only check first: this runs on every HLS live request.
+        if !self.drm_channels.read().unwrap().contains(id) {
+            return;
+        }
+        let csv = {
+            let mut set = self.drm_channels.write().unwrap();
+            if !set.remove(id) {
+                return;
+            }
+            learned_drm_csv(&set)
+        };
+        tracing::info!(channel = id, "channel has HLS again; no longer DRM-only");
+        if let Err(e) = self.store.set(DRM_LEARNED_KEY, &csv) {
+            tracing::warn!("could not save learned DRM channels: {e}");
         }
     }
 

@@ -194,10 +194,27 @@ impl RenderCaches {
         if channel_id.is_empty() {
             return false;
         }
-        match self.dead.read().unwrap().get(channel_id) {
-            Some(at) => at.elapsed() <= DEAD_CACHE_TTL,
-            None => false,
+
+        // Fast path for a live entry. Expired entries are removed below so
+        // probing a channel does not leave stale dead-channel keys resident.
+        let expired_at = {
+            let map = self.dead.read().unwrap();
+            match map.get(channel_id) {
+                Some(at) if at.elapsed() <= DEAD_CACHE_TTL => return true,
+                Some(at) => *at,
+                None => return false,
+            }
+        };
+
+        let mut map = self.dead.write().unwrap();
+        if map
+            .get(channel_id)
+            .map(|at| *at == expired_at)
+            .unwrap_or(false)
+        {
+            map.remove(channel_id);
         }
+        false
     }
 
     /// Marks the channel dead unless the caches were cleared since
@@ -210,6 +227,9 @@ impl RenderCaches {
         if self.generation() != generation {
             return;
         }
+        // Dead-channel markers have a short TTL. Prune stale keys whenever a
+        // new marker is inserted, preventing old channel IDs accumulating.
+        map.retain(|_, at| at.elapsed() <= DEAD_CACHE_TTL);
         map.insert(channel_id.to_string(), Instant::now());
     }
 
@@ -324,6 +344,169 @@ pub(crate) async fn fetch_live(
     }
     crate::token_refresh::ensure_fresh(state).await;
     state.tv.live(channel_id).await
+}
+
+/// Whether the provider response says a channel must be played through the
+/// DRM/MPD route: its DASH stream comes with a license URL (any HLS variant is
+/// then protected and shows a black screen in a plain player), or DASH is the
+/// only stream it offers.
+pub(crate) fn needs_drm_route(live: &LiveUrlOutput) -> bool {
+    live.has_drm_stream()
+        || (television::has_dash(live)
+            && television::select_best_live_hls_url(live, "auto").is_empty())
+}
+
+/// Most channels a single scan may add. A scan that wants more than this is
+/// more likely misreading the provider than finding that many new DRM
+/// channels, so it reports what it saw and changes nothing.
+const DRM_SCAN_MAX_NEW: usize = 60;
+
+/// Progress and outcome of the manual DRM channel scan (see `drm_scan_start`).
+#[derive(Clone)]
+pub(crate) struct DrmScanStatus {
+    pub running: bool,
+    pub checked: usize,
+    pub total: usize,
+    /// Channels the last finished scan added.
+    pub learned: Vec<String>,
+    pub message: String,
+}
+
+static DRM_SCAN: std::sync::Mutex<DrmScanStatus> = std::sync::Mutex::new(DrmScanStatus {
+    running: false,
+    checked: 0,
+    total: 0,
+    learned: Vec::new(),
+    message: String::new(),
+});
+
+fn scan_status() -> std::sync::MutexGuard<'static, DrmScanStatus> {
+    DRM_SCAN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn drm_scan_snapshot() -> DrmScanStatus {
+    scan_status().clone()
+}
+
+/// Clears `running` however the scan task ends, even if it panics.
+struct ScanGuard;
+
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        scan_status().running = false;
+    }
+}
+
+/// Starts a scan of the channels that are not on the static DRM list, unless
+/// one is already running, and returns the current status. Run on demand from
+/// the web UI: new channels appear every few months, so there is no schedule.
+/// The scan asks the provider about each such channel (one request every
+/// 1.5s) and records the ones `needs_drm_route` flags, so the next playlist
+/// refresh routes them through the DRM/MPD route; channels that no longer need
+/// it are forgotten. Results persist via `learn_drm`, so only changes are
+/// written.
+pub(crate) fn drm_scan_start(state: &Arc<AppState>) -> DrmScanStatus {
+    {
+        let mut status = scan_status();
+        if status.running {
+            return status.clone();
+        }
+        if !state.config.drm {
+            status.message = "DRM is turned off on this server.".to_string();
+            return status.clone();
+        }
+        if !state.tv.logged_in() {
+            status.message = "Log in to JioTV first.".to_string();
+            return status.clone();
+        }
+        *status = DrmScanStatus {
+            running: true,
+            checked: 0,
+            total: 0,
+            learned: Vec::new(),
+            message: "Starting...".to_string(),
+        };
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        let _guard = ScanGuard;
+        let (message, learned) = drm_scan_run(&state).await;
+        let mut status = scan_status();
+        status.message = message;
+        status.learned = learned;
+    });
+    drm_scan_snapshot()
+}
+
+async fn drm_scan_run(state: &AppState) -> (String, Vec<String>) {
+    let Ok(channels) = state.effective_channels().await else {
+        return ("Could not load the channel list.".to_string(), Vec::new());
+    };
+    let ids: Vec<String> = channels
+        .into_iter()
+        .map(|c| c.id)
+        .filter(|id| {
+            !id.is_empty()
+                && id.bytes().all(|b| b.is_ascii_digit())
+                && !crate::drm_channels::is_drm_channel(id)
+        })
+        .collect();
+    scan_status().total = ids.len();
+
+    let mut checked = 0usize;
+    let mut flagged: Vec<&String> = Vec::new();
+    let mut cleared: Vec<&String> = Vec::new();
+    for id in &ids {
+        if let Ok(live) = fetch_live(state, id).await {
+            checked += 1;
+            if needs_drm_route(&live) {
+                flagged.push(id);
+            } else {
+                cleared.push(id);
+            }
+        }
+        scan_status().checked = checked;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+    let mut new_ids: Vec<String> = {
+        let known = state.drm_channels.read().unwrap();
+        flagged
+            .iter()
+            .filter(|id| !known.contains(id.as_str()))
+            .map(|id| id.to_string())
+            .collect()
+    };
+    if new_ids.len() > DRM_SCAN_MAX_NEW {
+        tracing::warn!(
+            checked,
+            would_learn = new_ids.len(),
+            "DRM channel scan flagged too many channels; changing nothing"
+        );
+        return (
+            format!(
+                "Checked {checked} channels, but {} looked like DRM, which is too many to be right. Nothing was changed.",
+                new_ids.len()
+            ),
+            Vec::new(),
+        );
+    }
+    for id in &flagged {
+        state.learn_drm(id);
+    }
+    for id in &cleared {
+        state.unlearn_drm(id);
+    }
+    new_ids.sort();
+    tracing::info!(checked, learned = ?new_ids, "DRM channel scan finished");
+    let message = if new_ids.is_empty() {
+        format!("Checked {checked} channels. No new DRM channels found.")
+    } else {
+        format!(
+            "Checked {checked} channels. Found {} new DRM channel(s). Refresh the playlist in your IPTV app.",
+            new_ids.len()
+        )
+    };
+    (message, new_ids)
 }
 
 /// The recovery-path refetch used by `render_m3u8_handler`/
@@ -666,6 +849,11 @@ async fn live_impl_inner(
 
     let mut live_url = television::select_best_live_hls_url(&live, quality);
     if live_url.is_empty() {
+        // The provider serves this channel only as DASH: remember it, so the
+        // next playlist refresh points players at the DRM route.
+        if television::has_dash(&live) {
+            state.learn_drm(id);
+        }
         // A extras channel with only DASH: send the player to the MPD route.
         let is_custom = state.custom_channels.contains(id);
         let via_extras = state
@@ -682,6 +870,9 @@ async fn live_impl_inner(
             live.message
         );
         return (StatusCode::NOT_FOUND, message).into_response();
+    }
+    if !needs_drm_route(&live) {
+        state.unlearn_drm(id);
     }
     live_url = to_absolute_stream_url(&live_url, absolute_base_from_live(&live).as_deref());
     let live_hdnea = television::select_hls_hdnea_token(&live, quality, "");
@@ -913,7 +1104,7 @@ fn render_replace(
         channel_id,
         quality,
         scope,
-        state.config.disable_ts_handler,
+        state.config.disable_ts_handler && !state.config.ts_proxy_wanted(channel_id),
     );
     let entries = rendition_entries(
         body,
@@ -1350,14 +1541,22 @@ pub async fn render_ts_handler(
     if let Some(ct) = headers {
         builder = builder.header(header::CONTENT_TYPE, ct);
     }
-    builder.body(Body::from(body)).unwrap()
+    builder.body(body).unwrap()
+}
+
+/// Forwards an upstream response body to the client frame by frame instead
+/// of collecting it first. A segment is therefore never held in RAM as a whole
+/// (and never copied a second time), and if the player disconnects the
+/// upstream request is dropped with it.
+pub(crate) fn passthrough_body(resp: reqwest::Response) -> Body {
+    Body::new(reqwest::Body::from(resp))
 }
 
 async fn proxy_segment(
     state: &AppState,
     url: &str,
     hdnea: Option<&str>,
-) -> (u16, Vec<u8>, Option<String>) {
+) -> (u16, Body, Option<String>) {
     let ua = url::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(|h| state.extras.player_user_agent_for(h)))
@@ -1374,10 +1573,9 @@ async fn proxy_segment(
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
-            let body = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
-            (status, body, ct)
+            (status, passthrough_body(resp), ct)
         }
-        Err(_) => (502, Vec::new(), None),
+        Err(_) => (502, Body::empty(), None),
     }
 }
 

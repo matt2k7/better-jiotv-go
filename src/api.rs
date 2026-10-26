@@ -353,6 +353,29 @@ pub async fn jiotv_logout(State(state): State<SharedState>) -> Response {
     Json(json!({"status": true})).into_response()
 }
 
+/// `GET /api/drm/scan`: progress or result of the manual DRM channel scan.
+pub async fn drm_scan_status(State(state): State<SharedState>) -> Response {
+    scan_status_json(&state, crate::stream::drm_scan_snapshot())
+}
+
+/// `POST /api/drm/scan`: starts the scan (or reports the one already running).
+pub async fn drm_scan_start(State(state): State<SharedState>) -> Response {
+    scan_status_json(&state, crate::stream::drm_scan_start(&state))
+}
+
+fn scan_status_json(state: &AppState, s: crate::stream::DrmScanStatus) -> Response {
+    let learned_total = state.drm_channels.read().unwrap().len();
+    Json(json!({
+        "running": s.running,
+        "checked": s.checked,
+        "total": s.total,
+        "learned": s.learned,
+        "learnedTotal": learned_total,
+        "message": s.message,
+    }))
+    .into_response()
+}
+
 pub async fn rotate_key(State(state): State<SharedState>) -> Response {
     if state.config.disable_auth {
         return err(StatusCode::BAD_REQUEST, "auth is disabled");
@@ -608,6 +631,12 @@ fn live_play_response_from_live(
 
     if let Ok(out) = crate::dash::build_drm_mpd_output(state, live, id, quality) {
         if !out.play_url.is_empty() {
+            // DASH with no HLS alternative: remember it for the playlist.
+            if hls.is_null() {
+                state.learn_drm(id);
+            } else if !crate::stream::needs_drm_route(live) {
+                state.unlearn_drm(id);
+            }
             let license = if out.license_url.is_empty() {
                 serde_json::Value::Null
             } else {
